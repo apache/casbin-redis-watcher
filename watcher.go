@@ -21,6 +21,7 @@ type Watcher struct {
 	pubClient rds.UniversalClient
 	options   WatcherOptions
 	close     chan struct{}
+	closeOnce sync.Once
 	callback  func(string)
 	ctx       context.Context
 }
@@ -445,7 +446,17 @@ func (w *Watcher) subscribe() {
 		}()
 		ch := sub.Channel()
 		wg.Done()
-		for msg := range ch {
+		for {
+			var msg *rds.Message
+			select {
+			case <-w.close:
+				return
+			case message, ok := <-ch:
+				if !ok {
+					return
+				}
+				msg = message
+			}
 			select {
 			case <-w.close:
 				return
@@ -476,6 +487,5 @@ func (w *Watcher) GetWatcherOptions() WatcherOptions {
 func (w *Watcher) Close() {
 	w.l.Lock()
 	defer w.l.Unlock()
-	close(w.close)
-	w.pubClient.Publish(w.ctx, w.options.Channel, "Close")
+	w.closeOnce.Do(func() { close(w.close) })
 }

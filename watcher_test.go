@@ -1,9 +1,12 @@
 package rediswatcher_test
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +16,118 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
+
+func TestWatcherCloseDoesNotPublish(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+	defer client.Close()
+	channel := "/casbin-close-" + uuid.NewString()
+	observer := client.Subscribe(ctx, channel)
+	defer observer.Close()
+	if _, err := observer.Receive(ctx); err != nil {
+		t.Fatal(err)
+	}
+	messages := observer.Channel()
+	pubClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+	subClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+	watcher, err := rediswatcher.NewWatcher("", rediswatcher.WatcherOptions{
+		Channel: channel, PubClient: pubClient, SubClient: subClient,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			watcher.Close()
+		}
+	}()
+	updates := make(chan string, 1)
+	survivorID := uuid.NewString()
+	survivor, err := rediswatcher.NewWatcher("127.0.0.1:6379", rediswatcher.WatcherOptions{
+		Channel: channel,
+		LocalID: survivorID,
+		OptionalUpdateCallback: func(message string) {
+			updates <- message
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer survivor.Close()
+	waitForWatcherCondition(t, ctx, func() bool {
+		counts, err := client.PubSubNumSub(ctx, channel).Result()
+		return err == nil && counts[channel] == 3
+	})
+	watcher.Close()
+	closed = true
+	waitForWatcherCondition(t, ctx, func() bool {
+		counts, err := client.PubSubNumSub(ctx, channel).Result()
+		return err == nil && counts[channel] == 2 &&
+			errors.Is(pubClient.Ping(ctx).Err(), redis.ErrClosed) &&
+			errors.Is(subClient.Ping(ctx).Err(), redis.ErrClosed)
+	})
+	if err := survivor.Update(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case message := <-messages:
+		var update rediswatcher.MSG
+		if err := json.Unmarshal([]byte(message.Payload), &update); err != nil {
+			t.Fatalf("Close published a non-JSON message: %q", message.Payload)
+		}
+		if update.Method != rediswatcher.Update || update.ID != survivorID {
+			t.Fatalf("unexpected message after Close: %q", message.Payload)
+		}
+	case <-ctx.Done():
+		t.Fatal("surviving watcher did not publish an update")
+	}
+	select {
+	case <-updates:
+	case <-ctx.Done():
+		t.Fatal("surviving watcher did not receive an update")
+	}
+}
+
+func TestWatcherCloseIsIdempotent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pubClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+	subClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+	watcher, err := rediswatcher.NewWatcher("", rediswatcher.WatcherOptions{
+		Channel: "/casbin-close-" + uuid.NewString(), PubClient: pubClient, SubClient: subClient,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			watcher.Close()
+		}()
+	}
+	wg.Wait()
+	waitForWatcherCondition(t, ctx, func() bool {
+		return errors.Is(pubClient.Ping(ctx).Err(), redis.ErrClosed) &&
+			errors.Is(subClient.Ping(ctx).Err(), redis.ErrClosed)
+	})
+}
+
+func waitForWatcherCondition(t *testing.T, ctx context.Context, condition func() bool) {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for !condition() {
+		select {
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for watcher lifecycle condition")
+		case <-ticker.C:
+		}
+	}
+}
 
 func initWatcherWithOptions(t *testing.T, wo rediswatcher.WatcherOptions, cluster ...bool) (*casbin.Enforcer, *rediswatcher.Watcher) {
 	var (
